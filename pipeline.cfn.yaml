@@ -1,0 +1,402 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+#############################################
+# This is a genaric CI/CD pipeline.  It makes these assumptions:
+#  - Source is from (same account) CodeCommit repo
+#  - Deploy is via a CFn stack
+#  - There currently a presumption of a Lambda in the App to be deployed so we give S# access to
+#    ApplicationLambdaS3BucketName where appropriate. @Todo Remove the lambda assumption, make it conditional
+#
+# The only REQUIRED adaption to make for your app is to CodeDeployExecutionRoleAppSpecificPolicy
+# Limit it to the AWS resources used in your given app.
+#############################################
+
+Description: >
+  This is the CI/CD pipeline for the Sidecar Infra
+Parameters:
+  AppName:
+    Description: The Name for this App (used for labeling & resource name building)
+    Type: String
+    Default: SidecarInfra
+    ConstraintDescription: Alpha-numeric, start with letter, 2-20 characters
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]{2,20}'
+  BranchName:
+    Description: CodeCommit branch name
+    Type: String
+    Default: master
+  RepositoryName:
+    Description: CodeComit repository name
+    Type: String
+    Default: AWS-TC-Sidecar-Infra
+  ApplicationLambdaS3BucketName:
+    Description: The S3 bucket name where lambda assets for the app are stored
+    Type: String
+  BuildMachineType:
+    Type: String
+    Description: >
+      Linux of Windows. https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-codebuild-project-environment.html#cfn-codebuild-project-environment-type
+    AllowedValues: [LINUX_CONTAINER,WINDOWS_CONTAINER]
+    Default: LINUX_CONTAINER
+  BuildMachineImage:
+    Type: String
+    Description: >
+      Default to AmazonLinux2, see: https://docs.aws.amazon.com/codebuild/latest/userguide/build-env-ref-available.html
+    Default: aws/codebuild/amazonlinux2-x86_64-standard:1.0
+  BuildMachineSize:
+    Type: String
+    Description: >
+      Small, Medium or Large. https://docs.aws.amazon.com/codebuild/latest/userguide/build-env-ref-compute-types.html
+    AllowedValues: [BUILD_GENERAL1_SMALL,BUILD_GENERAL1_MEDIUM,BUILD_GENERAL1_LARGE]
+    Default: BUILD_GENERAL1_SMALL
+  DepoloymentCfnFileName:
+    Type: String
+    Description: >
+      The name of the CFn used for deployment. See https://docs.aws.amazon.com/cli/latest/reference/cloudformation/package.html,
+      https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-cli-command-reference-sam-package.html
+    Default: sc_infra.cfn.packaged.yaml
+
+Resources:
+
+  #############################################
+  # This is where you will most likely need to make edits for a specific app.  This is the Role
+  # the App CFn is created with so it needs CRUD permission for all the resources in the app CFn
+  #############################################
+  CodeDeployExecutionRoleAppSpecificPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${AppName}-CodePipelineServiceRoleAppSpecificPolicy
+      Roles:
+        - !Ref CodeDeployExecutionRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          # These are the resources the app CFn is creating
+          - Action:
+              - lambda:*
+              - dynamodb:*
+              - apigateway:*
+              - iam:*
+              - s3:*
+              - sqs:*
+            Effect: Allow
+            Resource: '*'
+
+  #############################################
+  # PLEASE review all below but for the most part it is generalized to work for the assumptions
+  # stated at the top of this template.
+  #############################################
+
+  # Here is the Pipeline for the App.
+  # Pretty generalized
+  #
+  #  [codecommit]
+  #        |
+  #  [run buildspec]
+  #        |
+  #  [CFn change set create]
+  #        |
+  #  [CFN change set execute]
+  #
+  AppPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${AppName}-Pipeline
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStores:
+        - Region: !Ref AWS::Region
+          ArtifactStore:
+            Location: !Ref CodePipelineArtifactStoreBucket
+            Type: S3
+      Stages:
+        - Name: SourceStage
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: CodeCommit
+              OutputArtifacts:
+                - Name: SourceStageOutputArtifact
+              Configuration:
+                BranchName: !Ref BranchName
+                RepositoryName: !Ref RepositoryName
+                PollForSourceChanges: false
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              Configuration:
+                ProjectName: !Ref BuildProject
+              InputArtifacts:
+                - Name: SourceStageOutputArtifact
+              OutputArtifacts:
+                - Name: BuildStageOutputArtifact
+        # Deployment to the Test Env
+        # Build then execute a change set
+        - Name: !Sub DeployTestEnv_${AppName}
+          Actions:
+            - Name: !Sub MakeChangeSetTest_${AppName}
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              Configuration:
+                StackName: !Sub ${AppName}
+                ActionMode: CHANGE_SET_REPLACE
+                ChangeSetName: ChangeSetUpdateTestEnv
+                TemplatePath: !Sub BuildStageOutputArtifact::${DepoloymentCfnFileName}
+                Capabilities: CAPABILITY_IAM
+                RoleArn: !GetAtt CodeDeployExecutionRole.Arn
+              InputArtifacts:
+                - Name: BuildStageOutputArtifact
+              OutputArtifacts: []
+              RunOrder: 1
+
+            - Name: !Sub ExecuteChangeSetTest_${AppName}
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              Configuration:
+                StackName: !Sub ${AppName}
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: ChangeSetUpdateTestEnv
+                RoleArn: !GetAtt CodeDeployExecutionRole.Arn
+              InputArtifacts: []
+              OutputArtifacts: []
+              RunOrder: 2
+
+  # Bucket CodePipeline will use to pass build artifacts
+  CodePipelineArtifactStoreBucket:
+    Type: AWS::S3::Bucket
+
+  # Enforce SSE on objects in this bucket
+  CodePipelineArtifactStoreBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CodePipelineArtifactStoreBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: DenyUnEncryptedObjectUploads
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub ${CodePipelineArtifactStoreBucket.Arn}/*
+            Condition:
+              StringNotEquals:
+                's3:x-amz-server-side-encryption': 'aws:kms'
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: !Sub ${CodePipelineArtifactStoreBucket.Arn}/*
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  # This rule pushes events to code pipeline when updates happen on the repo::branch being watched for this app.
+  AppRepoCloudWatchEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - CodeCommit Repository State Change
+        resources:
+          - !Sub arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${RepositoryName}
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - !Ref BranchName
+      Targets:
+        - Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AppPipeline}
+          RoleArn: !GetAtt AppRepoCloudWatchEventRuleRole.Arn
+          Id: codepipeline-AppPipeline
+
+  # Give this event rule only StartPipelineExecution
+  AppRepoCloudWatchEventRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service:
+                - events.amazonaws.com
+      Path: /
+      Policies:
+        - PolicyName: !Sub ${AppName}-AppRepoCloudWatchEventRuleRolePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AppPipeline}
+
+  # Generic build project.  Important properties are parameterized
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AppName}-BuildProject
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: !Ref BuildMachineSize
+        Image: !Ref BuildMachineImage
+        PrivilegedMode: false
+        Type: !Ref BuildMachineType
+      ServiceRole: !GetAtt CodeBuildExecutionRole.Arn
+      Source:
+        Type: CODEPIPELINE
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Sub ${AppName}-BuildOutputLogs
+          Status: ENABLED
+
+  # Execution Role used by CodeBuild
+  # It needs to Log to CWLogs and get/put objects to ApplicationLambdaS3BucketName and CodePipelineArtifactStoreBucket
+  CodeBuildExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              AWS: !Ref AWS::AccountId
+              Service: codebuild.amazonaws.com
+      Path: /
+      Policies:
+        - PolicyName: !Sub ${AppName}-CodeBuildExecutionRolePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: BuildOutputLogs
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource:
+                  # access to the build STDOUT logs
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AppName}-BuildOutputLogs
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AppName}-BuildOutputLogs:*
+                  # access to Code Build service logs
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AppName}-BuildProject
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AppName}-BuildProject:*
+              - Sid: AccessToCodePipelineArtifactsBucket
+                Action:
+                  - s3:PutObject
+                  - s3:Get*
+                Effect: Allow
+                Resource:
+                  # needs access to both where the lambda zips are stored and where the pipeline artifacts are stored
+                  - !Sub arn:aws:s3:::${ApplicationLambdaS3BucketName}/*
+                  - !Sub arn:aws:s3:::${CodePipelineArtifactStoreBucket}/*
+
+  # Since this is a CFn based Code Deploy this is the Role said CFn is executed as, so it need CRUD perms for any
+  # resources created in the App CFn
+  CodeDeployExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              AWS: !Ref AWS::AccountId
+              Service: cloudformation.amazonaws.com
+      Path: /
+      Policies:
+        - PolicyName: !Sub ${AppName}-CodeDeployExecutionRoleBoilerplatePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              # This CFn needs to get the Lambda src zip
+              - Action:
+                  - s3:Get*
+                Effect: Allow
+                Resource:
+                  - !Sub arn:aws:s3:::${ApplicationLambdaS3BucketName}/*
+              # The CodeDeploy action needs to be able to create a changeset for the App CFN
+              - Action:
+                  - cloudformation:CreateChangeSet
+                Effect: Allow
+                Resource: '*'
+
+  # This is the ROle for the CodePipeline itself. It is the outermost orchestrator so it needs
+  # codecommit:, codedeploy: & codebuild: IAM permission
+  # additionally it needs put/get to CodePipelineArtifactStoreBucket and cloudformation:* as it
+  # is managing the CFn based deployment.
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: !Sub ${AppName}-CodePipelineServiceRole
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codecommit:CancelUploadArchive
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:UploadArchive
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:RegisterApplicationRevision
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: '*'
+              - Effect: Allow
+                # Need to manage this CFn based deployment
+                Action:
+                  - cloudformation:*
+                Resource: '*'
+              - Sid: AccessToCodePipelineArtifactsBucket
+                Action:
+                  - s3:PutObject
+                  - s3:Get*
+                Effect: Allow
+                Resource:
+                  - !Sub arn:aws:s3:::${CodePipelineArtifactStoreBucket}/*
