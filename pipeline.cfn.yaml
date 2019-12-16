@@ -12,12 +12,12 @@ AWSTemplateFormatVersion: '2010-09-09'
 #############################################
 
 Description: >
-  This is the CI/CD pipeline for the Sidecar Infra
+  This is the CI/CD pipeline for the lambda based app
 Parameters:
   AppName:
     Description: The Name for this App (used for labeling & resource name building)
     Type: String
-    Default: SidecarInfra
+    Default: LambdaApp
     ConstraintDescription: Alpha-numeric, start with letter, 2-20 characters
     AllowedPattern: '[a-zA-Z][a-zA-Z0-9]{2,20}'
   BranchName:
@@ -27,7 +27,6 @@ Parameters:
   RepositoryName:
     Description: CodeComit repository name
     Type: String
-    Default: AWS-TC-Sidecar-Infra
   ApplicationLambdaS3BucketName:
     Description: The S3 bucket name where lambda assets for the app are stored
     Type: String
