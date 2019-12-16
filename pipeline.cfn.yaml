@@ -52,7 +52,7 @@ Parameters:
     Description: >
       The name of the CFn used for deployment. See https://docs.aws.amazon.com/cli/latest/reference/cloudformation/package.html,
       https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-cli-command-reference-sam-package.html
-    Default: sc_infra.cfn.packaged.yaml
+    Default: lambda_app.cfn.packaged.yaml
 
 Resources:
 
