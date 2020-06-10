@@ -33,7 +33,7 @@ Parameters:
   BuildMachineType:
     Type: String
     Description: >
-      Linux of Windows. https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-codebuild-project-environment.html#cfn-codebuild-project-environment-type
+      Linux or Windows. https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-codebuild-project-environment.html#cfn-codebuild-project-environment-type
     AllowedValues: [LINUX_CONTAINER,WINDOWS_CONTAINER]
     Default: LINUX_CONTAINER
   BuildMachineImage:
